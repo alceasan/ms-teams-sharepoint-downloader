@@ -153,18 +153,76 @@
     return true;
   }
 
+  // Relay the drive/item identity from g_fileInfo so the content script (which
+  // runs in the isolated world and cannot read g_fileInfo) can proactively
+  // fetch transcript metadata. Unlike the videomanifest — which is only
+  // requested once playback starts — g_fileInfo['.spItemUrl'] is present on
+  // page load. This is what fixes the Teams meeting-recap embed, where the user
+  // opens the Transcript panel without ever starting the video, so no manifest
+  // request fires for the content script to derive driveId/itemId from.
+  let transcriptContextPosted = false;
+  function tryPostTranscriptContext() {
+    if (transcriptContextPosted) return true;
+    const g = window.g_fileInfo;
+    const spItemUrl = g && g['.spItemUrl'];
+    if (!spItemUrl) return false;
+    try {
+      const u = new URL(spItemUrl);
+      const m = u.pathname.match(/^(\/(?:personal|sites)\/[^/]+)\/_api\/v[0-9.]+\/drives\/([^/]+)\/items\/([^/?]+)/);
+      if (!m) return false;
+      // Best human name for the file, extension stripped. document.title is
+      // unreliable in the Teams recap embed (it's the Teams shell title, not
+      // the video name), so relay the real name for the download dialogs.
+      const fileName = g.displayName ||
+        (g.name ? g.name.replace(/\.[^.]+$/, '') : null) ||
+        g.title || null;
+      console.log('[Transcript Downloader] Relaying transcript context from g_fileInfo (hasTranscripts=' + g.hasTranscripts + ')');
+      window.postMessage({
+        type: 'TRANSCRIPT_CONTEXT',
+        sitePath: m[1],
+        driveId: m[2],
+        itemId: m[3],
+        hasTranscripts: g.hasTranscripts,
+        fileName: fileName
+      }, '*');
+      transcriptContextPosted = true;
+      return true;
+    } catch (e) {
+      console.error('[Transcript Downloader] Error parsing g_fileInfo .spItemUrl:', e);
+      return false;
+    }
+  }
+
+  function tryPostAll() {
+    // `&` not `&&` — always attempt both; only report done when both succeed.
+    return tryPostManifest() & tryPostTranscriptContext() ? true : false;
+  }
+
   // Try immediately
-  if (!tryPostManifest()) {
+  if (!tryPostAll()) {
     // Hook into OnLoadVideoFileInfo if available
     const originalOnLoad = window.OnLoadVideoFileInfo;
     window.OnLoadVideoFileInfo = function() {
       if (originalOnLoad) originalOnLoad.apply(this, arguments);
-      tryPostManifest();
+      tryPostAll();
     };
 
     // Also try on window load
     window.addEventListener('load', function() {
-      setTimeout(tryPostManifest, 1000);
+      setTimeout(tryPostAll, 1000);
     });
   }
+
+  // The content script (isolated world) may attach its message listener AFTER
+  // our initial one-shot post, so it asks us to re-send on demand. Reset the
+  // guard and re-post whatever we have. This is the fix for intermittent
+  // transcript-context capture caused by the intercept/content load-order race.
+  window.addEventListener('message', function(event) {
+    if (event.source !== window) return;
+    if (event.data && event.data.type === 'TTD_REQUEST_CONTEXT') {
+      transcriptContextPosted = false;
+      tryPostTranscriptContext();
+      tryPostManifest();
+    }
+  });
 })();

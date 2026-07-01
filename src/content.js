@@ -20,6 +20,13 @@
   // Replayed on our proactive transcript-metadata fetch so it works in
   // guest/anonymous viewer scenarios where cookie auth alone is refused.
   let spApiBearer = null;
+  // Drive/item identity mined from the page's `g_fileInfo` global by
+  // intercept.js (MAIN world) and relayed here. This lets us derive the
+  // transcript context without waiting for a videomanifest request — critical
+  // for the Teams meeting-recap embed, where the user opens the Transcript
+  // panel without ever starting playback (so no manifest is ever fetched).
+  // Shape: { driveId, itemId, sitePath, hasTranscripts, fileName }.
+  let gFileTranscriptContext = null;
 
   // Global segment-fetch budget — total in flight across all tracks. SharePoint
   // throttles around the low-teens for many tenants, so default 4 keeps us
@@ -54,6 +61,23 @@
     if (event.data.type === 'TRANSCRIPT_METADATA') {
       console.log('[Transcript Downloader] Received transcript metadata:', event.data);
       transcriptUrl = event.data.temporaryDownloadUrl;
+      updateFloatingWidgetState();
+    }
+
+    if (event.data.type === 'TRANSCRIPT_CONTEXT') {
+      // driveId/itemId/sitePath parsed from g_fileInfo['.spItemUrl'] in the
+      // MAIN world. Available on page load without playback, so it fixes the
+      // recap embed where deriveTranscriptContext() otherwise had no manifest
+      // to mine the drive/item identity from.
+      gFileTranscriptContext = {
+        driveId: event.data.driveId || null,
+        itemId: event.data.itemId || null,
+        sitePath: event.data.sitePath || null,
+        hasTranscripts: event.data.hasTranscripts,
+        fileName: event.data.fileName || null
+      };
+      console.debug('[Transcript Downloader] Captured transcript context from g_fileInfo',
+        { hasTranscripts: gFileTranscriptContext.hasTranscripts });
       updateFloatingWidgetState();
     }
 
@@ -152,6 +176,17 @@
     return div.innerHTML;
   }
 
+  // Best available base name for pre-filling the download filename fields.
+  // Prefers g_fileInfo.displayName (relayed from the MAIN world by intercept.js)
+  // because document.title is the Teams shell title inside the recap embed, not
+  // the video name. Falls back to document.title on the classic Stream page.
+  function getDefaultBaseName() {
+    if (gFileTranscriptContext && gFileTranscriptContext.fileName) {
+      return gFileTranscriptContext.fileName;
+    }
+    return document.title;
+  }
+
   function updateButtonText(format) {
     const modalButton = document.querySelector('#modalDownload');
     if (!modalButton) return;
@@ -183,7 +218,7 @@
     }
     
     // Get auto-detected filename
-    const autoTitle = document.title.replace(/[^a-z0-9\s]/gi, '_').trim();
+    const autoTitle = getDefaultBaseName().replace(/[^a-z0-9\s]/gi, '_').trim();
     const displayTitle = autoTitle || '[Not detected]';
     
     modal.innerHTML = `
@@ -466,7 +501,17 @@
       } catch (_) { /* ignore */ }
     }
 
-    // 2. Fall back to current page path for sitePath if not yet known
+    // 2. g_fileInfo (relayed from the MAIN world by intercept.js) carries the
+    //    same drive/item identity and is present on page load without playback.
+    //    This is the source that makes the proactive fetch work in the Teams
+    //    meeting-recap embed, where no videomanifest request ever fires for us.
+    if ((!driveId || !itemId || !sitePath) && gFileTranscriptContext) {
+      if (!driveId) driveId = gFileTranscriptContext.driveId || null;
+      if (!itemId) itemId = gFileTranscriptContext.itemId || null;
+      if (!sitePath) sitePath = gFileTranscriptContext.sitePath || null;
+    }
+
+    // 3. Fall back to current page path for sitePath if not yet known
     if (!sitePath) {
       const m = window.location.pathname.match(/^\/(?:personal|sites)\/[^/]+/);
       if (m) sitePath = m[0];
@@ -475,11 +520,55 @@
     return { driveId, itemId, sitePath };
   }
 
+  // The g_fileInfo → TRANSCRIPT_CONTEXT relay is a one-shot the MAIN-world
+  // intercept posts at document_start. If content.js (document_idle) attaches
+  // its message listener after that post, the message is missed — which made
+  // capture intermittent (the intercept logged hasTranscripts=true ~80ms before
+  // content.js even loaded). Fix: let content.js ask the MAIN world to re-post.
+  function requestTranscriptContext() {
+    try { window.postMessage({ type: 'TTD_REQUEST_CONTEXT' }, '*'); } catch (_) { /* ignore */ }
+  }
+
+  // Resolve once we have a usable drive/item identity, or after `timeoutMs`.
+  // Re-requests the context (covers the load-order race) then polls the
+  // module-scoped state the message handler populates.
+  function waitForTranscriptContext(timeoutMs) {
+    return new Promise((resolve) => {
+      const haveIt = () => !!(gFileTranscriptContext && gFileTranscriptContext.driveId && gFileTranscriptContext.itemId);
+      if (haveIt()) { resolve(true); return; }
+      requestTranscriptContext();
+      const start = Date.now();
+      const iv = setInterval(() => {
+        if (haveIt() || Date.now() - start > timeoutMs) {
+          clearInterval(iv);
+          resolve(haveIt());
+        }
+      }, 100);
+    });
+  }
+
   // Fetch transcript metadata directly from /_api/v2.1/.../media/transcripts.
   // SharePoint Stream only fires this request when the user opens the Transcript
   // panel, so if the user clicks our Download button before doing so we have to
   // fetch it ourselves rather than wait for the intercept hook.
   async function fetchTranscriptUrl() {
+    // Ensure we actually have the g_fileInfo-derived context before deciding
+    // anything. The MAIN-world relay is a one-shot; if our listener attached
+    // after it fired, we missed it (the intermittent-capture bug). Ask for a
+    // re-post and wait briefly. Fast/no-op when we already have it or a
+    // manifest to derive the identity from.
+    if (!videoManifestUrl && !(gFileTranscriptContext && gFileTranscriptContext.driveId)) {
+      await waitForTranscriptContext(1500);
+    }
+
+    // g_fileInfo tells us up-front whether this file was ever transcribed. If
+    // it definitively says no, skip the API round-trip and give the accurate
+    // "no transcript" message rather than the vaguer "couldn't determine it".
+    if (gFileTranscriptContext && gFileTranscriptContext.hasTranscripts === false) {
+      console.debug('[Transcript Downloader] g_fileInfo reports hasTranscripts=false');
+      return { status: 'none' };
+    }
+
     const { driveId, itemId, sitePath } = deriveTranscriptContext();
     if (!driveId || !itemId || !sitePath) {
       console.warn('[Transcript Downloader] Cannot proactively fetch transcript metadata — missing context', { driveId, itemId, sitePath });
@@ -1604,7 +1693,7 @@
   }
 
   function getVideoFilename() {
-    return document.title.replace(/[^a-z0-9\s]/gi, '_').trim() || 'video';
+    return getDefaultBaseName().replace(/[^a-z0-9\s]/gi, '_').trim() || 'video';
   }
 
   function createVideoModal() {
@@ -1818,6 +1907,11 @@
   function initialize() {
     if (__ttdInitDone) return;
     __ttdInitDone = true;
+
+    // Pull the g_fileInfo-derived context from the MAIN world now, in case its
+    // one-shot post landed before our message listener existed (load-order
+    // race). The intercept re-posts on this request.
+    requestTranscriptContext();
 
     // Pull saved per-track concurrency from sync storage; fall back to the
     // module default if absent or set to an unsupported value.
