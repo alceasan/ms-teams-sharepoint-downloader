@@ -895,12 +895,21 @@
     });
   }
 
-  // Fetch with retry on 429/503 + transient network errors. Honours the
+  // Fetch with retry on 409/429/503 + transient network errors. Honours the
   // `Retry-After` header (seconds) if the server sends one; otherwise uses
   // exponential backoff capped at 30s. Gives up after `maxAttempts`. The
   // optional `onThrottle({attempt, delayMs, status})` callback lets the
   // caller surface "throttled, backing off..." in the progress UI.
-  async function fetchWithRetry(url, init, signal, onThrottle, maxAttempts = 6) {
+  //
+  // 409 gets a larger attempt budget than 429/503: the Stream segment URLs are
+  // an on-the-fly transcode endpoint (oneDrive.transcode) that returns HTTP 409
+  // Conflict while a given segment is still being transcoded server-side. The
+  // same URL returns 200 once the transcode finishes and is cached, so 409 is a
+  // "not ready yet — come back" signal, not a hard failure. Cold segments on a
+  // long recording can take a while to warm, so we wait it out longer than a
+  // plain throttle. (429/503 stay at the default so genuine overload still fails
+  // fast enough to surface to the user.)
+  async function fetchWithRetry(url, init, signal, onThrottle, maxAttempts = 6, maxAttempts409 = 12) {
     let attempt = 0;
     for (;;) {
       attempt++;
@@ -918,8 +927,10 @@
         await abortableSleep(delayMs, signal);
         continue;
       }
-      // 429 = throttle; 503 = transient overload. Anything else: surface to caller.
-      if ((resp.status === 429 || resp.status === 503) && attempt < maxAttempts) {
+      // 409 = transcode not ready (retry, generous budget); 429 = throttle;
+      // 503 = transient overload. Anything else: surface to caller.
+      const attemptCap = resp.status === 409 ? maxAttempts409 : maxAttempts;
+      if ((resp.status === 409 || resp.status === 429 || resp.status === 503) && attempt < attemptCap) {
         const headerSecs = parseInt(resp.headers.get('Retry-After'), 10);
         const delayMs = Number.isFinite(headerSecs) && headerSecs > 0
           ? Math.min(headerSecs * 1000, 30000)
@@ -946,7 +957,12 @@
 
     function reportProgress(text) { onProgress(done, totalSegs, text); }
     function noteThrottle({ attempt, delayMs, status }) {
-      lastThrottleStatus = `HTTP ${status || 'network'} — backing off ${Math.round(delayMs / 1000)}s (attempt ${attempt})...`;
+      const secs = Math.round(delayMs / 1000);
+      // 409 = the server is still transcoding this segment; frame it as
+      // "preparing" rather than an error code so users don't read it as a crash.
+      lastThrottleStatus = status === 409
+        ? `Segment still transcoding — retrying in ${secs}s (attempt ${attempt})...`
+        : `HTTP ${status || 'network'} — backing off ${secs}s (attempt ${attempt})...`;
       reportProgress(lastThrottleStatus);
     }
 
